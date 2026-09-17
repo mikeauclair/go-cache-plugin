@@ -6,10 +6,12 @@
 package gobuild
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"expvar"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -22,7 +24,7 @@ import (
 	"github.com/creachadair/gocache"
 	"github.com/creachadair/gocache/cachedir"
 	"github.com/creachadair/taskgroup"
-	"github.com/tailscale/go-cache-plugin/lib/s3util"
+	"github.com/mikeauclair/go-cache-plugin/lib/s3util"
 )
 
 // S3Cache implements callbacks for a gocache.Server using an S3 bucket for
@@ -77,14 +79,15 @@ type S3Cache struct {
 	push     *taskgroup.Group
 	start    func(taskgroup.Task)
 
-	getLocalHit  expvar.Int // count of Get hits in the local cache
-	getFaultHit  expvar.Int // count of Get hits faulted in from S3
-	getFaultMiss expvar.Int // count of Get faults that were misses
-	putSkipSmall expvar.Int // count of "small" objects not written to S3
-	putS3Found   expvar.Int // count of objects not written to S3 because they were already present
-	putS3Action  expvar.Int // count of actions written to S3
-	putS3Object  expvar.Int // count of objects written to S3
-	putS3Error   expvar.Int // count of errors writing to S3
+	getLocalHit   expvar.Int // count of Get hits in the local cache
+	getFaultHit   expvar.Int // count of Get hits faulted in from S3
+	getFaultMiss  expvar.Int // count of Get faults that were misses
+	putSkipSmall  expvar.Int // count of "small" objects not written to S3
+	putSkipModIdx expvar.Int // count of module-index objects not written to S3
+	putS3Found    expvar.Int // count of objects not written to S3 because they were already present
+	putS3Action   expvar.Int // count of actions written to S3
+	putS3Object   expvar.Int // count of objects written to S3
+	putS3Error    expvar.Int // count of errors writing to S3
 }
 
 func (s *S3Cache) init() {
@@ -159,6 +162,15 @@ func (s *S3Cache) Put(ctx context.Context, obj gocache.Object) (diskPath string,
 		s.putSkipSmall.Add(1)
 		return diskPath, nil // don't bother uploading this, it's too small
 	}
+	// Module-index objects for main-module packages are keyed on file modtime
+	// (cmd/go/internal/modindex dirHash), so their action IDs never recur across
+	// a fresh checkout -- uploading them is pure waste. Keep them local-only.
+	// (Dep-module indexes share the same blob format and are cheap to reparse
+	// locally, so folding them in too is an acceptable cost.)
+	if isModuleIndexObject(diskPath) {
+		s.putSkipModIdx.Add(1)
+		return diskPath, nil
+	}
 
 	// Try to push the record to S3 in the background.
 	s.start(func() error {
@@ -186,6 +198,28 @@ func (s *S3Cache) Put(ctx context.Context, obj gocache.Object) (diskPath string,
 	return diskPath, nil
 }
 
+// moduleIndexHeader is the magic prefix written by cmd/go/internal/modindex
+// (indexVersion "go index v2", write.go) at the start of every module-index
+// blob, for both whole-module and per-package indexes.
+var moduleIndexHeader = []byte("go index v2\n")
+
+// isModuleIndexObject reports whether the staged object at diskPath is a Go
+// module-index blob, identified by its magic header. Errors (missing file,
+// short read) are treated as "not an index" so a sniff failure only ever falls
+// back to the normal upload path.
+func isModuleIndexObject(diskPath string) bool {
+	f, err := os.Open(diskPath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, len(moduleIndexHeader))
+	if _, err := io.ReadFull(f, buf); err != nil {
+		return false
+	}
+	return bytes.Equal(buf, moduleIndexHeader)
+}
+
 // Close implements the corresponding callback of the cache protocol.
 func (s *S3Cache) Close(ctx context.Context) error {
 	if s.push != nil {
@@ -203,6 +237,7 @@ func (s *S3Cache) SetMetrics(_ context.Context, m *expvar.Map) {
 	m.Set("get_fault_hit", &s.getFaultHit)
 	m.Set("get_fault_miss", &s.getFaultMiss)
 	m.Set("put_skip_small", &s.putSkipSmall)
+	m.Set("put_skip_module_index", &s.putSkipModIdx)
 	m.Set("put_s3_found", &s.putS3Found)
 	m.Set("put_s3_action", &s.putS3Action)
 	m.Set("put_s3_object", &s.putS3Object)
