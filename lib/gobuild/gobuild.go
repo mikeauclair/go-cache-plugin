@@ -180,7 +180,7 @@ func (s *S3Cache) Put(ctx context.Context, obj gocache.Object) (diskPath string,
 
 		// Stage 1: Maybe write the object. Do this before writing the action
 		// record so we are less likely to get a spurious miss later.
-		mtime, err := s.maybePutObject(sctx, obj.OutputID, diskPath, etr.ETag())
+		mtime, err := s.maybePutObject(sctx, obj.ActionID, obj.OutputID, diskPath, etr.ETag())
 		if err != nil {
 			return err
 		}
@@ -247,7 +247,7 @@ func (s *S3Cache) SetMetrics(_ context.Context, m *expvar.Map) {
 // maybePutObject writes the specified object contents to S3 if there is not
 // already a matching key with the same etag. It returns the modified time of
 // the object file, whether or not it was sent to S3.
-func (s *S3Cache) maybePutObject(ctx context.Context, outputID, diskPath, etag string) (time.Time, error) {
+func (s *S3Cache) maybePutObject(ctx context.Context, actionID, outputID, diskPath, etag string) (time.Time, error) {
 	f, err := os.Open(diskPath)
 	if err != nil {
 		gocache.Logf(ctx, "[s3] open local object %s: %v", outputID, err)
@@ -270,6 +270,12 @@ func (s *S3Cache) maybePutObject(ctx context.Context, outputID, diskPath, etag s
 		return fi.ModTime(), nil // already present and matching
 	}
 	s.putS3Object.Add(1)
+	// TEMPORARY (measurement): identify the non-index objects we still upload.
+	// Log action/output IDs, size, and leading magic bytes so uploads can be
+	// correlated against GODEBUG=gocachehash output and characterized by kind.
+	var magic [16]byte
+	n, _ := f.ReadAt(magic[:], 0)
+	gocache.Logf(ctx, "[s3-upload] action=%s output=%s size=%d magic=%q", actionID, outputID, fi.Size(), magic[:n])
 	return fi.ModTime(), nil
 }
 
